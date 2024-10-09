@@ -1,0 +1,156 @@
+name: Publish Bicep Module
+description: Publishes the Bicep module to an ACR and updates Git tags accordingly.
+
+inputs:
+  root-path:
+    description: The root path for the modules.
+    required: true
+
+  module-name:
+    description: "The name of the module. This should include the full relative path below the root-path, not including any leading or trailing '/'. Example: 'subnet' or 'modules/subnet'."
+    required: true
+
+  update-parent-versions:
+    description: "Setting this parameter to 'true' will force updates of parent major and minor versions. Example: Updating '1.0.0' will create/update '1.0' and '1' as well."
+    required: false
+    default: "true"
+
+  force:
+    description: Setting this parameter to 'true' will overwrite git tags and ACR modules for all relevant version tags (see update-parent-versions).
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Normalize module name
+      id: normalize-params
+      shell: pwsh
+      env:
+        rootPath: ${{ inputs.root-path }}
+        moduleName: ${{ inputs.module-name }}
+      run: |
+        #* Normalize module name
+        $rootPath = $env:rootPath.Trim("/")
+        $moduleName = $env:moduleName.ToLower().Trim("/")
+
+        #* Write outputs
+        Write-Output "root-path=$rootPath" >> $env:GITHUB_OUTPUT
+        Write-Output "module-name=$moduleName" >> $env:GITHUB_OUTPUT
+
+    - name: Assert module files
+      shell: pwsh
+      env:
+        rootPath: ${{ steps.normalize-params.outputs.root-path }}
+        moduleName: ${{ steps.normalize-params.outputs.module-name }}
+        actionPath: ${{ github.action_path }}
+      run: |
+        #* Assert-ModuleFiles.ps1
+        $moduleRelativePath = Resolve-Path -Relative (Join-Path $env:rootPath $env:moduleName)
+        & "$($env:actionPath)/src/Assert-ModuleFiles.ps1" -Path $moduleRelativePath
+
+    - name: Get config
+      id: get-config
+      shell: pwsh
+      env:
+        rootPath: ${{ steps.normalize-params.outputs.root-path }}
+        moduleName: ${{ steps.normalize-params.outputs.module-name }}
+        actionPath: ${{ github.action_path }}
+        debug: ${{ runner.debug }}
+      run: |
+        #* Get PublishConfig.ps1
+
+        #* Set debug preference from runner configuration
+        $DebugPreference = [bool]$env:debug ? "Continue" : "SilentlyContinue"
+
+        #* Get config
+        $config = & "$($env:actionPath)/src/Get-PublishConfig.ps1" `
+          -RootPath $env:rootPath `
+          -ModuleName $env:moduleName `
+
+        #* Write outputs
+        Write-Output "registry=$($config.bicepRegistryFqdn)" >> $env:GITHUB_OUTPUT
+        Write-Output "azure-cli-version=$($config.azureCliVersion ?? "latest")" >> $env:GITHUB_OUTPUT
+
+    - name: Get Versions to update
+      id: get-versions
+      shell: pwsh
+      env:
+        rootPath: ${{ steps.normalize-params.outputs.root-path }}
+        moduleName: ${{ steps.normalize-params.outputs.module-name }}
+        updateParentVersions: ${{ inputs.update-parent-versions == 'true' }}
+        force: ${{ inputs.force == 'true' }}
+        actionPath: ${{ github.action_path }}
+        debug: ${{ runner.debug }}
+      run: |
+        #* Get-VersionsToUpdate.ps1
+
+        #* Set debug preference from runner configuration
+        $DebugPreference = [bool]$env:debug ? "Continue" : "SilentlyContinue"
+
+        #* Fetch git tags
+        git fetch --tags --quiet
+
+        #* Get tags to update
+        $versionsToUpdate = & "$($env:actionPath)/src/Get-VersionsToUpdate.ps1" `
+          -RootPath $env:rootPath `
+          -ModuleName $env:moduleName `
+          -ExistingTags @(git tag) `
+          -UpdateParentVersions ([bool]::Parse($env:updateParentVersions)) `
+          -Force ([bool]::Parse($env:force)
+        )
+
+        #* Write outputs
+        Write-Output "versions-to-update=$($versionsToUpdate | ConvertTo-Json -Compress)" >> $env:GITHUB_OUTPUT
+
+    - name: Set Git config
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $repoName = gh repo view --json name -q ".name"
+        git config --global user.name "$repoName[bot]"
+        git config --global user.email "$repoName[bot]@users.noreply.github.com"
+
+    - name: Create and update git tags
+      id: set-tags
+      shell: pwsh
+      env:
+        moduleName: ${{ steps.normalize-params.outputs.module-name }}
+        versionsToUpdate: ${{ steps.get-versions.outputs.versions-to-update }}
+        debug: ${{ runner.debug }}
+      run: |
+        #* Create and update git tags
+
+        #* Set debug preference from runner configuration
+        $DebugPreference = [bool]$env:debug ? "Continue" : "SilentlyContinue"
+
+        #* Push tags
+        $versionsToUpdate = $env:versionsToUpdate | ConvertFrom-Json
+
+        foreach ($version in $versionsToUpdate) {
+          $tag = "$($env:moduleName)/$version"
+          git tag --force --annotate $tag --message "Automatically generated tag."
+          git push origin $tag --force
+        }
+
+    - name: Publish module
+      uses: azure/CLI@v2
+      env:
+        rootPath: ${{ steps.normalize-params.outputs.root-path }}
+        moduleName: ${{ steps.normalize-params.outputs.module-name }}
+        registry: ${{ steps.get-config.outputs.registry }}
+        htmlUrl: ${{ github.event.repository.html_url }}
+        versionsToUpdate: ${{ steps.get-versions.outputs.versions-to-update }}
+      with:
+        azcliversion: ${{ steps.get-config.outputs.azure-cli-version }}
+        inlineScript: |
+          #* Publish module
+
+          echo $versionsToUpdate | jq ".[]" -r | xargs -I % \
+            az bicep publish \
+            --file "$rootPath/$moduleName/main.bicep" \
+            --target "br:$registry/$moduleName:%" \
+            --documentation-uri "$htmlUrl/blob/$moduleName/%/$rootPath/$moduleName/README.md" \
+            --with-source \
+            --force
