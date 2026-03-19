@@ -135,7 +135,7 @@ runs:
         }
 
     - name: Publish module
-      uses: azure/CLI@v3
+      uses: azure/CLI@v2
       env:
         rootPath: ${{ steps.normalize-params.outputs.root-path }}
         moduleName: ${{ steps.normalize-params.outputs.module-name }}
